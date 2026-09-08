@@ -1,0 +1,31 @@
+[project]
+name = "score-assistant"
+version = "0.1.0"
+description = "听曲目生成乐谱的辅助工具（基于 MuScriptor 多乐器转录模型）"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "muscriptor",
+    "pillow>=12.3.0",
+    "pyside6>=6.11.2",
+    "sounddevice>=0.5.6",
+    "torch==2.7.1 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torchaudio==2.7.1 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "verovio>=6.3.0",
+]
+
+# Windows/Linux 下从 PyTorch 官方 cu128 源安装 CUDA 版 torch；
+# 无 NVIDIA GPU 的机器可删除下面两节（将改装 CPU 版）。
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+]
+# PyPI 0.3.0 尚无乐谱排版（utils/sheets.py），改用 git main 分支。
+muscriptor = { git = "https://github.com/muscriptor/muscriptor.git" }

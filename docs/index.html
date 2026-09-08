@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>乐谱助手 · 听曲目生成乐谱</title>
+<style>
+  :root { --ink:#1f2328; --dim:#656d76; --accent:#e0245e; --bg:#ffffff; --soft:#f6f8fa; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif; color: var(--ink); background: var(--bg); line-height: 1.7; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px 80px; }
+  header { padding: 64px 0 32px; border-bottom: 1px solid #eaecef; }
+  h1 { font-size: 2.2rem; }
+  h1 small { display:block; font-size: 1rem; color: var(--dim); font-weight: normal; margin-top: 8px; }
+  .badges { margin-top: 16px; }
+  .badges a { display: inline-block; background: var(--ink); color: #fff; text-decoration: none; padding: 6px 14px; border-radius: 6px; font-size: .9rem; margin-right: 8px; }
+  .badges a.alt { background: var(--soft); color: var(--ink); border: 1px solid #d0d7de; }
+  h2 { font-size: 1.3rem; margin: 40px 0 12px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  p, li { color: var(--ink); }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 16px; margin-top: 16px; }
+  figure { background: var(--soft); border: 1px solid #d0d7de; border-radius: 8px; padding: 10px; }
+  figure img { width: 100%; border-radius: 4px; display: block; }
+  figcaption { font-size: .85rem; color: var(--dim); margin-top: 8px; }
+  code { background: var(--soft); border: 1px solid #d0d7de; border-radius: 4px; padding: 1px 6px; font-size: .9em; }
+  pre { background: var(--soft); border: 1px solid #d0d7de; border-radius: 8px; padding: 14px; overflow-x: auto; font-size: .9rem; }
+  .note { background: #fff8e6; border: 1px solid #f0d98c; border-radius: 8px; padding: 12px 16px; margin-top: 16px; font-size: .92rem; }
+  footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid #eaecef; color: var(--dim); font-size: .85rem; }
+  a { color: #0366d6; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>乐谱助手<small>听曲目生成乐谱 · 基于 MuScriptor 多乐器转录模型（arXiv:2607.08168）</small></h1>
+    <div class="badges">
+      <a href="https://github.com/lychees/music_transcription">GitHub 仓库</a>
+      <a class="alt" href="https://arxiv.org/abs/2607.08168">论文</a>
+      <a class="alt" href="https://github.com/muscriptor/muscriptor">模型</a>
+    </div>
+  </header>
+
+  <h2>这是什么</h2>
+  <p>一个 Windows 桌面小工具：给它一首歌（本地音频文件或 B 站视频链接），它用开源多乐器转录模型 <strong>MuScriptor</strong> 把音乐转录成 MIDI 和乐谱，并提供一个能「跟着看」的乐谱播放器。</p>
+
+  <h2>功能</h2>
+  <ul>
+    <li><strong>输入</strong>：本地音频（wav/mp3/flac/m4a…）或 B 站视频链接（BV/av/b23.tv、?p=N 分集），单框自动识别。</li>
+    <li><strong>输出</strong>：未量化 MIDI（聆听/DAW 用）+ 量化 MIDI + MusicXML + 总谱/分谱 PDF（吉他/贝斯另有六线谱 PDF）。</li>
+    <li><strong>乐谱跟随播放</strong>：播放原音频，当前音符在谱面上实时高亮，自动滚动翻页；点击任意音符跳转播放。</li>
+    <li><strong>三种记谱法</strong>：五线谱 / 简谱 / 吉他谱（六线谱 TAB，标准调弦自动分配弦品位，可导出文本 TAB）。</li>
+    <li><strong>和弦进行</strong>：实时显示调性与当前和弦，进行序列随播放推进，和弦标记叠加在谱面上。</li>
+    <li><strong>钢琴键盘演示</strong>：底部 88 键键盘按声部分色实时点亮发声键。</li>
+  </ul>
+
+  <h2>界面</h2>
+  <div class="grid">
+    <figure>
+      <img src="img/score_staff.png" alt="五线谱跟随播放">
+      <figcaption>五线谱跟随播放 + 和弦进行（卡农钢琴曲，B 站链接转录）</figcaption>
+    </figure>
+    <figure>
+      <img src="img/piano_keyboard.png" alt="钢琴键盘演示">
+      <figcaption>底部钢琴键盘实时点亮发声键</figcaption>
+    </figure>
+    <figure>
+      <img src="img/guitar_tab.png" alt="吉他谱">
+      <figcaption>吉他谱（六线谱 TAB）视图与和弦标记（指弹《Unravel》）</figcaption>
+    </figure>
+  </div>
+
+  <h2>快速开始</h2>
+  <p>需要 Windows + Python 3.10–3.12 + <a href="https://docs.astral.sh/uv/">uv</a>。</p>
+  <pre>git clone https://github.com/lychees/music_transcription.git
+cd music_transcription
+uv sync                 # 有 NVIDIA GPU 会自动装 CUDA 版 PyTorch</pre>
+  <p>然后双击 <code>启动乐谱助手.bat</code>。首次使用需要：</p>
+  <ul>
+    <li><strong>HuggingFace 授权</strong>（模型权重为 CC BY-NC 4.0 许可，仅限非商业用途）：登录 HF，在模型页接受许可，创建 read token 填入工具内的登录设置。</li>
+    <li><strong>MuseScore 4+</strong>：仅当需要导出乐谱 PDF 时（工具界面可指定其路径；只生成 MIDI 则不需要）。</li>
+  </ul>
+  <div class="note">节拍稳定的录音效果最好（乐谱需要量化到节拍网格）；自由速度（rubato）的录音排版效果会明显下降。模型权重仅供非商业用途（CC BY-NC 4.0）。</div>
+
+  <h2>技术要点</h2>
+  <ul>
+    <li>转录：MuScriptor（decoder-only transformer，5 秒 mel 分块自回归解码，支持乐器条件限定）。</li>
+    <li>乐谱排版：MusicXML → verovio（SVG + 时间→音符映射），Qt 离屏渲染进 tkinter 画布。</li>
+    <li>简谱 / 吉他谱：自研排版（唱名映射、减时线增时线、跨拍连线、标准调弦品位分配）。</li>
+    <li>和弦：节拍窗口音级模板匹配 + 惯性平滑；调性用 Krumhansl-Schmuckler 估计。</li>
+  </ul>
+
+  <footer>
+    <p>乐谱助手代码以 MIT 许可发布；MuScriptor 模型权重为 CC BY-NC 4.0（非商业用途）；MuseScore 与其音色库各有其许可。</p>
+    <p>论文引用：Rouard, Krause, Roebel, Simon-Gabriel, Défossez. <em>MuScriptor: An Open Model for Multi-Instrument Music Transcription</em>. arXiv:2607.08168, 2026.</p>
+  </footer>
+</div>
+</body>
+</html>

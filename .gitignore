@@ -1,0 +1,10 @@
+.venv/
+vendor/
+downloads/
+test_output/
+.downloads/
+.sessions/
+__pycache__/
+*.pyc
+*.pyo
+bilibili_score/
