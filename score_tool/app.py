@@ -158,6 +158,12 @@ class ScoreAssistantApp(tk.Tk):
 
         self.player = ScorePlayer(self, self.nb)
         self.nb.add(self.player.frame, text="乐谱播放")
+        self.nb.bind(
+            "<<NotebookTabChanged>>",
+            lambda _e: self.player.on_tab_shown()
+            if self.nb.select() == str(self.player.frame)
+            else None,
+        )
 
     # ------------------------------------------------------------------ 环境
     def _refresh_env_async(self) -> None:

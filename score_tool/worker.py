@@ -102,7 +102,6 @@ def download_bilibili(url: str, out_dir: str | Path, on_log: LogCb | None = None
 
     直接走 B 站公开 API（www 页面有反爬 412，API 没有），不依赖 yt-dlp。
     """
-    import shutil
     import subprocess
     import urllib.request
 
@@ -133,6 +132,11 @@ def download_bilibili(url: str, out_dir: str | Path, on_log: LogCb | None = None
         raise RuntimeError("未能获取音频流地址（视频可能需要登录、付费或已下架）")
     best = max(audios, key=lambda a: a.get("bandwidth", 0))
 
+    wav = out_dir / f"{_safe_name(title)}.wav"
+    if wav.is_file() and wav.stat().st_size > 0:
+        log(f"已下载过，直接使用：{wav.name}")
+        return wav
+
     log("下载音频流…")
     req = urllib.request.Request(
         best["baseUrl"],
@@ -140,7 +144,17 @@ def download_bilibili(url: str, out_dir: str | Path, on_log: LogCb | None = None
     )
     m4s = out_dir / f"{_safe_name(title)}.m4s"
     with urllib.request.urlopen(req, timeout=600) as r, open(m4s, "wb") as f:
-        shutil.copyfileobj(r, f)
+        total = int(r.headers.get("Content-Length") or 0)
+        done, next_mark = 0, 10
+        while True:
+            chunk = r.read(1 << 18)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total and done * 100 // total >= next_mark:
+                log(f"下载中 {done * 100 // total}%（{done // 1048576}/{total // 1048576} MB）")
+                next_mark += 10
 
     wav = m4s.with_suffix(".wav")
     subprocess.run(

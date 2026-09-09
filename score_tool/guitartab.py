@@ -143,13 +143,16 @@ class GuitarTabScore:
         self.beat_s = base.beat_s
         self.measure_s = base.measure_s
         self.tracks: list[tuple[_Track, list[int], list[str]]] = []
-        for track in base.tracks:
+        self.source_indices: list[int] = []  # 各 TAB 声部在全部声部中的序号（配色对齐用）
+        for ti, track in enumerate(base.tracks):
             if track.is_drum:
                 continue
             if is_guitar(track.program):
                 self.tracks.append((track, GUITAR_TUNING, GUITAR_NAMES))
+                self.source_indices.append(ti)
             elif is_bass(track.program):
                 self.tracks.append((track, BASS_TUNING, BASS_NAMES))
+                self.source_indices.append(ti)
 
     # ------------------------------------------------------------------ 布局
     def layout(self, width_px: float) -> TabLayout:
@@ -233,6 +236,36 @@ class GuitarTabScore:
             if m_start - 1e-6 <= n[0] < m_end - 1e-6:
                 events.setdefault(round(n[0] / unit), []).append(n)
         return events
+
+    def build_tab_slots(self, beat_s: float) -> tuple[dict[int, list[tuple[int, int, str]]], float]:
+        """把品位分配展开成 16 分槽位 → [(track_idx, string_idx, fret_text)]。
+
+        track_idx 为 TAB 声部序号；配色请用 source_indices 映射到全部声部序号。
+        """
+        slot_s = beat_s / 4
+        slots: dict[int, list[tuple[int, int, str]]] = {}
+        for ti, (track, tuning, _names) in enumerate(self.tracks):
+            prev_mean = 5.0
+            t_end = max(n[1] for n in track.notes)
+            first_bar = int(math.floor(track.notes[0][0] / self.measure_s))
+            last_bar = int(math.ceil(t_end / self.measure_s)) - 1
+            for b in range(first_bar, last_bar + 1):
+                m_start, m_end = b * self.measure_s, (b + 1) * self.measure_s
+                for key, chord in sorted(self._measure_events(track, m_start, m_end, slot_s).items()):
+                    start = key * slot_s
+                    end = min(max(n[1] for n in chord), m_end)
+                    assigned = assign_frets([p for _, _, p in chord], tuning, prev_mean)
+                    frets = [int(f) for _, f in assigned.values() if f.isdigit()]
+                    if frets:
+                        prev_mean = sum(frets) / len(frets)
+                    i0 = int(start / slot_s)
+                    i1 = max(i0 + 1, math.ceil(end / slot_s))
+                    for pitch, (si, text) in assigned.items():
+                        if si < 0:
+                            continue
+                        for i in range(i0, i1):
+                            slots.setdefault(i, []).append((ti, si, text))
+        return slots, slot_s
 
     # ------------------------------------------------------------------ 文本导出
     def to_ascii(self, measures_per_row: int = 4) -> str:

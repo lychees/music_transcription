@@ -327,16 +327,103 @@ class PianoKeyboard:
 
 
 def build_pitch_slots(tracks, beat_s: float) -> tuple[dict[int, list[tuple[int, int]]], float]:
-    """把各声部音符展开成 16 分槽位 → [(pitch, track_idx)]，供 O(1) 查询。"""
+    """把各声部音符展开成 16 分槽位 → [(pitch, track_idx)]，供 O(1) 查询。
+
+    鼓声部跳过：鼓点音高在钢琴键盘上没有意义。
+    """
     slot_s = beat_s / 4
     slots: dict[int, list[tuple[int, int]]] = {}
     for ti, track in enumerate(tracks):
+        if getattr(track, "is_drum", False):
+            continue
         for start, end, pitch in track.notes:
             i0 = int(start / slot_s)
             i1 = max(i0 + 1, math.ceil(end / slot_s))
             for i in range(i0, i1):
                 slots.setdefault(i, []).append((pitch, ti))
     return slots, slot_s
+
+
+class GuitarBoard:
+    """吉他/贝斯指板演示：点亮当前按下的 (弦, 品位)。"""
+
+    STRING_GAP = 18
+
+    def __init__(self, tk_mod, parent, label: str, string_names: list[str], color: str, n_frets: int = 19):
+        self._tk = tk_mod
+        self.color = color
+        self.string_names = string_names
+        self.n_frets = n_frets
+        self.frame = tk_mod.Frame(parent)
+        tk_mod.Label(self.frame, text=label, font=("Microsoft YaHei UI", 8), foreground="#666666").pack(
+            anchor="w", padx=4
+        )
+        h = (len(string_names) - 1) * self.STRING_GAP + 46
+        self.canvas = tk_mod.Canvas(self.frame, height=h, bg="#f6f2ea", highlightthickness=0)
+        self.canvas.pack(fill=tk_mod.X)
+        self._dots: list[int] = []
+        self._drawn_w = 0
+        self._geom = None
+        self.canvas.bind("<Configure>", lambda _e: self._draw())
+
+    def _draw(self) -> None:
+        w = self.canvas.winfo_width()
+        if w < 80 or w == self._drawn_w:
+            return
+        self._drawn_w = w
+        self.canvas.delete("all")
+        self._dots.clear()
+        margin_l, margin_r = 46, 12
+        top = 12
+        ys = [top + i * self.STRING_GAP for i in range(len(self.string_names))]
+        fret_w = (w - margin_l - margin_r) / self.n_frets
+        for i, nm in enumerate(self.string_names):
+            self.canvas.create_text(margin_l - 26, ys[i], text=nm, font=("Arial", 8), fill="#666666", anchor="e")
+            self.canvas.create_line(margin_l, ys[i], w - margin_r, ys[i], fill="#333333")
+        for f in range(self.n_frets + 1):  # 品丝（琴枕加粗）
+            x = margin_l + f * fret_w
+            self.canvas.create_line(x, top - 4, x, ys[-1] + 4, fill="#333333", width=3 if f == 0 else 1)
+        mid_y = (ys[0] + ys[-1]) / 2  # 品位标记点
+        for f in (3, 5, 7, 9, 15, 17, 19):
+            if f <= self.n_frets:
+                x = margin_l + f * fret_w - fret_w / 2
+                self.canvas.create_oval(x - 3, mid_y - 3, x + 3, mid_y + 3, fill="#c9c2b4", outline="")
+        if 12 <= self.n_frets:
+            x = margin_l + 12 * fret_w - fret_w / 2
+            for dy in (-9, 9):
+                self.canvas.create_oval(x - 3, mid_y + dy - 3, x + 3, mid_y + dy + 3, fill="#c9c2b4", outline="")
+        for f in (1, 3, 5, 7, 9, 12, 15, 17, 19):  # 品位数字
+            if f <= self.n_frets:
+                self.canvas.create_text(margin_l + f * fret_w - fret_w / 2, ys[-1] + 14,
+                                        text=str(f), font=("Arial", 7), fill="#999999")
+        self._geom = (margin_l, fret_w, ys)
+
+    def set_active(self, positions: list[tuple[int, str]]) -> None:
+        for d in self._dots:
+            self.canvas.delete(d)
+        self._dots.clear()
+        if self._geom is None:
+            return
+        margin_l, fret_w, ys = self._geom
+        for si, text in positions:
+            if not 0 <= si < len(ys):
+                continue
+            if text.isdigit():
+                f = int(text)
+                x = margin_l + f * fret_w - fret_w / 2 if f > 0 else margin_l - 8
+                r = 7
+                self._dots.append(
+                    self.canvas.create_oval(x - r, ys[si] - r, x + r, ys[si] + r,
+                                            fill=self.color, outline="#333333")
+                )
+            else:  # 无法按出的音：琴枕左侧画 ×
+                self._dots.append(
+                    self.canvas.create_text(margin_l - 8, ys[si], text="×",
+                                            font=("Arial", 9, "bold"), fill="#cc0000")
+                )
+
+    def clear(self) -> None:
+        self.set_active([])
 
 
 class AudioPlayer:
@@ -435,10 +522,32 @@ class ScorePlayer:
         self._tab = None  # GuitarTabScore（含吉他/贝斯声部时非空）
         self._tab_layout = None  # 当前 TAB 布局
         self._pitch_slots: dict = {}  # 16 分槽位 → [(pitch, track_idx)]
+        self._tab_slots: dict = {}  # 16 分槽位 → [(tab_track_idx, string_idx, fret)]
         self._slot_s = 0.125
+        self._boards: list = []  # GuitarBoard 列表（按 TAB 声部）
+        self._last_fit: float | None = None  # 上次渲染的可用宽度（tab 显示时校验重排用）
 
         self._build_ui()
         self.show_placeholder("转录完成后，乐谱会显示在这里")
+        # 快捷键：空格播放/暂停，←/→ 快退/快进 5 秒
+        self.root.bind("<space>", self._on_space)
+        self.root.bind("<Left>", lambda _e: self._seek_rel(-5.0))
+        self.root.bind("<Right>", lambda _e: self._seek_rel(5.0))
+
+    def _focus_is_text_input(self) -> bool:
+        w = self.root.focus_get()
+        return w is not None and w.winfo_class() in (
+            "Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "ScrolledText",
+            "Button", "TButton", "Checkbutton", "TCheckbutton",
+        )
+
+    def _on_space(self, _e) -> None:
+        if not self._focus_is_text_input():
+            self.toggle_play()
+
+    def _seek_rel(self, delta: float) -> None:
+        if self.audio is not None and not self._focus_is_text_input():
+            self.audio.seek_seconds(self.audio.position_seconds() + delta)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -506,14 +615,22 @@ class ScorePlayer:
         self.chord_strip.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         self.chord_strip.tag_configure("cur", background="#ffe08a", font=("Microsoft YaHei UI", 9, "bold"))
         self.chord_strip.tag_configure("dim", foreground="#999")
+        self.chord_strip.bind("<Button-1>", self._on_strip_click)
         self.kb_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             chord_bar, text="钢琴键盘", variable=self.kb_var, command=self._toggle_keyboard
         ).pack(side=tk.RIGHT, padx=4)
+        self.gb_var = tk.BooleanVar(value=True)
+        self.gb_check = ttk.Checkbutton(
+            chord_bar, text="吉他指板", variable=self.gb_var, command=self._toggle_boards
+        )
+        self.gb_check.pack(side=tk.RIGHT, padx=4)
 
         self.canvas = tk.Canvas(self.frame, bg="#888888", highlightthickness=0)
         hscroll = ttk.Scrollbar(self.frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
         hscroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.gb_frame = ttk.Frame(self.frame)
+        self.gb_frame.pack(side=tk.BOTTOM, fill=tk.X)
         self.kb_frame = ttk.Frame(self.frame)
         self.kb_frame.pack(side=tk.BOTTOM, fill=tk.X)
         self.keyboard = PianoKeyboard(tk, self.kb_frame)
@@ -565,7 +682,7 @@ class ScorePlayer:
                 chords, key = [], ""
                 jp = None
                 tab = None
-                pitch_slots, slot_s = {}, 0.125
+                pitch_slots, tab_slots, slot_s = {}, {}, 0.125
                 if midi_path and Path(midi_path).is_file():
                     from score_tool.chords import detect_chords, estimate_key, parse_midi_notes
                     from score_tool.jianpu import JianpuScore
@@ -577,7 +694,9 @@ class ScorePlayer:
                     jp = JianpuScore(str(midi_path), key)
                     tab = GuitarTabScore(str(midi_path))
                     pitch_slots, slot_s = build_pitch_slots(jp.tracks, 60.0 / bpm)
-                self._load_q.put(("ready", model, data, sr, offset, chords, key, jp, tab, pitch_slots, slot_s))
+                    if tab.tracks:
+                        tab_slots, _ = tab.build_tab_slots(60.0 / bpm)
+                self._load_q.put(("ready", model, data, sr, offset, chords, key, jp, tab, pitch_slots, tab_slots, slot_s))
             except Exception as e:  # noqa: BLE001
                 self._load_q.put(("error", e))
 
@@ -600,7 +719,7 @@ class ScorePlayer:
         else:
             self.show_placeholder(f"乐谱加载失败：{payload[0]}")
 
-    def _on_model_ready(self, model, data, sr, offset, chords, key, jp, tab, pitch_slots, slot_s) -> None:
+    def _on_model_ready(self, model, data, sr, offset, chords, key, jp, tab, pitch_slots, tab_slots, slot_s) -> None:
         self.stop()
         self.model = model
         self.audio = AudioPlayer(data, sr)
@@ -613,12 +732,31 @@ class ScorePlayer:
         self._tab = tab
         self._tab_layout = None
         self._pitch_slots = pitch_slots
+        self._tab_slots = tab_slots
         self._slot_s = slot_s
         self._cur_chord_idx = -1
         self.key_label.config(text=f"调性：{key}" if key else "")
         self.export_tab_btn.config(
             state=self._tk.NORMAL if (tab is not None and tab.tracks) else self._tk.DISABLED
         )
+        # 吉他指板演示板
+        for w in self.gb_frame.winfo_children():
+            w.destroy()
+        self._boards = []
+        if tab is not None and tab.tracks:
+            for ti, (track, _tuning, names) in enumerate(tab.tracks):
+                color = KB_PALETTE[tab.source_indices[ti] % len(KB_PALETTE)]
+                board = GuitarBoard(self._tk, self.gb_frame, track.name, names, color)
+                board.frame.pack(fill=self._tk.X, pady=1)
+                self._boards.append(board)
+        if self._boards:
+            self.gb_var.set(True)
+            self.gb_check.config(state=self._tk.NORMAL)
+            self.gb_frame.pack(side=self._tk.BOTTOM, fill=self._tk.X)
+        else:
+            self.gb_var.set(False)
+            self.gb_check.config(state=self._tk.DISABLED)
+            self.gb_frame.pack_forget()
         self._build_chord_strip()
         self._render_pages(self._status_cb)
         self._status_cb("就绪")
@@ -628,12 +766,27 @@ class ScorePlayer:
         self.chord_strip.config(state=self._tk.NORMAL)
         self.chord_strip.delete("1.0", self._tk.END)
         self._strip_ranges = []
+        self._strip_char_ranges = []
         for i, span in enumerate(self.chord_spans):
             label = span.label or "·"
             start_idx = self.chord_strip.index(self._tk.END + "-1c")
             self.chord_strip.insert(self._tk.END, (" " if i == 0 else " | ") + label)
-            self._strip_ranges.append((start_idx, self.chord_strip.index(self._tk.END + "-1c")))
+            end_idx = self.chord_strip.index(self._tk.END + "-1c")
+            self._strip_ranges.append((start_idx, end_idx))
+            self._strip_char_ranges.append(
+                (int(start_idx.split(".")[1]), int(end_idx.split(".")[1]))
+            )
         self.chord_strip.config(state=self._tk.DISABLED)
+
+    def _on_strip_click(self, e) -> None:
+        """点击和弦进行中的某个和弦 → 跳到该段（与点击谱面一致，只跳转不自动播放）。"""
+        if self.audio is None or not self.chord_spans:
+            return
+        char = int(self.chord_strip.index(f"@{e.x},{e.y}").split(".")[1])
+        for i, (s, en) in enumerate(self._strip_char_ranges):
+            if s <= char < en:
+                self.audio.seek_seconds(self.chord_spans[i].start + self.offset_s)
+                return
 
     def _render_pages(self, status=lambda s: None) -> None:
         """按当前记谱法与缩放渲染谱面（GUI 线程）。"""
@@ -655,6 +808,7 @@ class ScorePlayer:
 
         # 页宽跟随窗口（缩放百分比在此基础上放大）
         fit = self.canvas.winfo_width() - 2 * self.PAGE_GAP - 24
+        self._last_fit = fit
         width_px = int(max(400, fit) * self.zoom)
         y = float(self.PAGE_GAP)
         for i, (svg, vbw, vbh, positions) in enumerate(self.model.pages):
@@ -761,6 +915,17 @@ class ScorePlayer:
             self.root.after_cancel(self._resize_after)
         self._resize_after = self.root.after(350, self._render_pages)
 
+    def on_tab_shown(self) -> None:
+        """播放页 tab 变为可见时：若可用宽度与上次渲染不符则重排。
+
+        首次加载在隐藏 tab 上会以很小的宽度渲染，切回时需按真实宽度重排。
+        """
+        if self.model is None or self._last_fit is None:
+            return
+        fit = self.canvas.winfo_width() - 2 * self.PAGE_GAP - 24
+        if abs(fit - self._last_fit) > 4:
+            self._render_pages()
+
     def _on_notation(self) -> None:
         self.notation = {"五线谱": "staff", "简谱": "jianpu", "吉他谱": "tab"}.get(
             self.notation_var.get(), "staff"
@@ -838,6 +1003,7 @@ class ScorePlayer:
         self._highlight_items.clear()
 
         fit = self.canvas.winfo_width() - 2 * self.PAGE_GAP - 24
+        self._last_fit = fit
         width_px = max(400, fit) * self.zoom
         self._tab_layout = self._tab.layout(width_px)
         draw_tab(self.canvas, self._tab_layout)
@@ -867,6 +1033,7 @@ class ScorePlayer:
         self._highlight_items.clear()
 
         fit = self.canvas.winfo_width() - 2 * self.PAGE_GAP - 24
+        self._last_fit = fit
         width_px = max(400, fit) * self.zoom
         self._jp_layout = self._jp.layout(width_px)
         draw_jianpu(self.canvas, self._jp_layout)
@@ -887,6 +1054,8 @@ class ScorePlayer:
             self.audio.pause()
             self.play_btn.config(text="▶ 播放")
             self.keyboard.clear()
+            for b in self._boards:
+                b.clear()
         else:
             self.audio.play()
             self.play_btn.config(text="⏸ 暂停")
@@ -898,6 +1067,8 @@ class ScorePlayer:
         self._clear_highlights()
         self._update_transport(0.0)
         self.keyboard.clear()
+        for b in self._boards:
+            b.clear()
         # 和弦提示复位
         self.chord_label.config(text="—")
         for s, e in self._strip_ranges:
@@ -957,7 +1128,24 @@ class ScorePlayer:
                 self._highlight(el.get("notes", []), el.get("page", 1))
             self._update_chord_display(score_ms / 1000.0)
             self._update_keyboard(score_ms / 1000.0)
+            self._update_boards(score_ms / 1000.0)
         self.root.after(30, self._tick)
+
+    def _update_boards(self, score_s: float) -> None:
+        if not self._boards or not self._tab_slots:
+            return
+        active = self._tab_slots.get(int(score_s / self._slot_s), [])
+        per_track: dict[int, list] = {}
+        for ti, si, text in active:
+            per_track.setdefault(ti, []).append((si, text))
+        for ti, board in enumerate(self._boards):
+            board.set_active(per_track.get(ti, []))
+
+    def _toggle_boards(self) -> None:
+        if self.gb_var.get():
+            self.gb_frame.pack(side=self._tk.BOTTOM, fill=self._tk.X)
+        else:
+            self.gb_frame.pack_forget()
 
     def _update_keyboard(self, score_s: float) -> None:
         if not self._pitch_slots:
