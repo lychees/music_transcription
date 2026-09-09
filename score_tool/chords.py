@@ -176,3 +176,47 @@ def estimate_key(notes: list[tuple[float, float, int]]) -> str:
         if c > best[0]:
             best = (c, f"{NOTE_NAMES[root]} 小调")
     return best[1]
+
+
+def roman_for_chord(label: str, key_label: str) -> str:
+    """和弦标记 → 调内级数（罗马数字）。如 C 大调的 F→IV、Am→vi；A 小调的 E→V。"""
+    import re as _re
+
+    if not label or not key_label:
+        return ""
+    m = _re.match(r"^([A-G]#?)", label)
+    if not m:
+        return ""
+    root = NOTE_NAMES.index(m.group(1))
+    suffix = label[len(m.group(1)):]
+    name, _, kind = key_label.partition(" ")
+    if name not in NOTE_NAMES:
+        return ""
+    tonic = NOTE_NAMES.index(name)
+    minor_key = kind.startswith("小")
+    iv = (root - tonic) % 12
+    if "dim" in suffix or "♭5" in suffix:
+        q = "dim"
+    elif "aug" in suffix:
+        q = "aug"
+    elif suffix.startswith("m") and not suffix.startswith("maj"):
+        q = "m"
+    else:
+        q = ""
+    MAJ = {0: "I", 2: "ii", 4: "iii", 5: "IV", 7: "V", 9: "vi", 11: "vii°"}
+    MIN = {0: "i", 2: "ii°", 3: "III", 5: "iv", 7: "v", 8: "VI", 10: "VII"}
+    table = MIN if minor_key else MAJ
+    if iv in table:
+        r = table[iv]
+        if minor_key and q == "":
+            r = r.upper()
+        if q == "dim" and not r.endswith("°"):
+            r += "°"
+        elif q == "aug":
+            r += "+"
+        return r
+    # 变化音级：大和弦就近降号、小和弦就近升号
+    base, pref = (iv - 1, "♭") if q == "" else (iv + 1, "#")
+    if base % 12 in table:
+        return pref + table[base % 12]
+    return ""

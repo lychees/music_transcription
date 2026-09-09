@@ -454,16 +454,39 @@ class NoteHighway:
         self.canvas.pack(fill=tk_mod.X)
         self._items: dict[tuple, tuple] = {}  # note -> (rect, )
         self._notes: list[tuple[float, float, int, int]] = []
+        self._starts: list[float] = []
+        self._cur_score_s = 0.0
+        self.on_seek = None  # 点击音符回调（start_s）
         self.canvas.bind("<Configure>", lambda _e: self._draw_static())
+        self.canvas.bind("<Button-1>", self._on_click)
         self._draw_static()
 
     def set_notes(self, notes: list[tuple[float, float, int, int]]) -> None:
         """(start_s, end_s, pitch, track_idx)，谱面时间。"""
         self._notes = notes
+        self._starts = [n[0] for n in notes]
         for rect, in self._items.values():
             self.canvas.delete(rect)
         self._items.clear()
         self._draw_static()
+
+    def _on_click(self, e) -> None:
+        """点击音符 → 跳到其开始时刻。"""
+        if self.on_seek is None or not self._items:
+            return
+        now_y = self.height - 26
+        scale = (self.height - 40) / self.WINDOW_S
+        t = self._cur_score_s + (now_y - e.y) / scale
+        best, best_d = None, 0.5
+        for n, (rect,) in self._items.items():
+            st, en, _p, _ti = n
+            coords = self.canvas.coords(rect)
+            if coords and coords[0] - 4 <= e.x <= coords[2] + 4 and st - 0.25 <= t < en + 0.25:
+                d = abs((st + en) / 2 - t)
+                if d < best_d:
+                    best, best_d = st, d
+        if best is not None:
+            self.on_seek(best)
 
     def _draw_static(self) -> None:
         self.canvas.delete("static")
@@ -475,6 +498,9 @@ class NoteHighway:
         kb = self.keyboard
         if not self._notes or not getattr(kb, "_key_center", None):
             return
+        from bisect import bisect_left
+
+        self._cur_score_s = score_s
         now_y = self.height - 26
         scale = (self.height - 40) / self.WINDOW_S
         lo, hi = score_s - 0.3, score_s + self.WINDOW_S
@@ -484,10 +510,13 @@ class NoteHighway:
         for n in past:
             self.canvas.delete(self._items[n][0])
             del self._items[n]
-        # 添加进入窗口的音符
-        for n in self._notes:
+        # 添加进入窗口的音符（二分定位窗口起点）
+        i0 = bisect_left(self._starts, lo)
+        for n in self._notes[i0:]:
             st, en, p, ti = n
-            if en < lo or st > hi or n in self._items:
+            if st > hi:
+                break
+            if n in self._items:
                 continue
             x = kb._key_center.get(p)
             if x is None:
@@ -687,6 +716,7 @@ class ScorePlayer:
         self._cur_chord_idx: int = -1
         self._chord_overlay: dict[int, int] = {}  # 和弦段序号 → 画布文本项
         self._strip_ranges: list[tuple[str, str]] = []  # 和弦条中每段的字符区间
+        self._romans: list[str] = []  # 每段的级数标记
         self.notation = "staff"  # "staff" 五线谱 | "jianpu" 简谱 | "tab" 吉他谱
         self._jp = None  # JianpuScore（有量化 MIDI 时构建）
         self._jp_layout = None  # 当前简谱布局
@@ -810,6 +840,10 @@ class ScorePlayer:
         self.loop_label.pack(side=tk.LEFT, padx=6)
         ttk.Button(pr, text="◀ 小节", width=7, command=lambda: self._seek_measure(-1)).pack(side=tk.LEFT, padx=(8, 2))
         ttk.Button(pr, text="小节 ▶", width=7, command=lambda: self._seek_measure(1)).pack(side=tk.LEFT)
+        ttk.Label(pr, text="跳到：").pack(side=tk.LEFT, padx=(10, 2))
+        self.bar_no_var = tk.StringVar(value="1")
+        ttk.Spinbox(pr, from_=1, to=9999, textvariable=self.bar_no_var, width=5).pack(side=tk.LEFT)
+        ttk.Button(pr, text="跳转", width=5, command=self._seek_to_bar).pack(side=tk.LEFT, padx=2)
         self.metro_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(pr, text="节拍器", variable=self.metro_var, command=self._toggle_metronome).pack(side=tk.LEFT, padx=(10, 2))
         self.countin_var = tk.BooleanVar(value=False)
@@ -837,6 +871,8 @@ class ScorePlayer:
         self.chord_strip.tag_configure("cur", background="#ffe08a", font=("Microsoft YaHei UI", 9, "bold"))
         self.chord_strip.tag_configure("dim", foreground="#999")
         self.chord_strip.bind("<Button-1>", self._on_strip_click)
+        self._legend_frame = ttk.Frame(chord_bar)
+        self._legend_frame.pack(side=tk.LEFT, padx=6)
         self.kb_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             chord_bar, text="钢琴键盘", variable=self.kb_var, command=self._toggle_keyboard
@@ -992,6 +1028,8 @@ class ScorePlayer:
         self._tab_slots = tab_slots
         self._slot_s = slot_s
         self._cur_chord_idx = -1
+        self._key = key
+        self._romans: list[str] = []
         self.key_label.config(text=f"调性：{key}" if key else "")
         # —— 练习功能初始化 ——
         self._audio_data = data
@@ -1016,6 +1054,7 @@ class ScorePlayer:
                 for start, end, pitch in track.notes:
                     highway_notes.append((start, end, pitch, ti))
         self.highway.set_notes(highway_notes)
+        self.highway.on_seek = lambda st: self._seek_to(st + self.offset_s)
         # MIDI 伴音
         self.companion.events = listen_evs or []
         self.companion.idx = 0
@@ -1038,6 +1077,20 @@ class ScorePlayer:
                 board = GuitarBoard(self._tk, self.gb_frame, track.name, names, color)
                 board.frame.pack(fill=self._tk.X, pady=1)
                 self._boards.append(board)
+        # 声部颜色图例（与键盘/瀑布流/指板同色）
+        for w in self._legend_frame.winfo_children():
+            w.destroy()
+        if jp:
+            for ti, track in enumerate(jp.tracks):
+                if getattr(track, "is_drum", False):
+                    continue
+                cell = self._tk.Frame(self._legend_frame)
+                cell.pack(side=self._tk.LEFT, padx=4)
+                sw = self._tk.Canvas(cell, width=10, height=10, highlightthickness=0)
+                sw.create_rectangle(1, 1, 9, 9, fill=KB_PALETTE[ti % len(KB_PALETTE)], outline="")
+                sw.pack(side=self._tk.LEFT)
+                self._tk.Label(cell, text=track.name, font=("Microsoft YaHei UI", 8),
+                               foreground="#666").pack(side=self._tk.LEFT, padx=2)
         if self._boards:
             self.gb_var.set(True)
             self.gb_check.config(state=self._tk.NORMAL)
@@ -1052,12 +1105,17 @@ class ScorePlayer:
         self._start_timer()
 
     def _build_chord_strip(self) -> None:
+        from score_tool.chords import roman_for_chord
+
         self.chord_strip.config(state=self._tk.NORMAL)
         self.chord_strip.delete("1.0", self._tk.END)
         self._strip_ranges = []
         self._strip_char_ranges = []
+        self._romans = [roman_for_chord(s.label, self._key) for s in self.chord_spans]
         for i, span in enumerate(self.chord_spans):
             label = span.label or "·"
+            if self._romans[i]:
+                label = f"{label}({self._romans[i]})"
             start_idx = self.chord_strip.index(self._tk.END + "-1c")
             self.chord_strip.insert(self._tk.END, (" " if i == 0 else " | ") + label)
             end_idx = self.chord_strip.index(self._tk.END + "-1c")
@@ -1462,7 +1520,7 @@ class ScorePlayer:
             elif self.notation == "tab":
                 self._highlight_tab(score_ms / 1000.0)
             else:
-                self._highlight(el.get("notes", []), el.get("page", 1))
+                self._highlight(el.get("notes", []), el.get("page", 1), el.get("measure"))
             self._update_chord_display(score_ms / 1000.0)
             self._update_keyboard(score_ms / 1000.0)
             self._update_boards(score_ms / 1000.0)
@@ -1568,7 +1626,8 @@ class ScorePlayer:
             self.chord_label.config(text="—")
             return
         label = self.chord_spans[idx].label or "·"
-        self.chord_label.config(text=label)
+        roman = self._romans[idx] if idx < len(self._romans) else ""
+        self.chord_label.config(text=f"{label}（{roman}）" if roman else label)
         s, e = self._strip_ranges[idx]
         self.chord_strip.tag_add("cur", s, e)
         self.chord_strip.see(s)
@@ -1669,6 +1728,16 @@ class ScorePlayer:
         target = math.floor(cur / self._measure_s) * self._measure_s + d * self._measure_s
         self._seek_to(max(0.0, target))
 
+    def _seek_to_bar(self) -> None:
+        """跳到第 N 小节。"""
+        if self.audio is None or not self._measure_s:
+            return
+        try:
+            n = max(1, int(self.bar_no_var.get()))
+        except ValueError:
+            return
+        self._seek_to((n - 1) * self._measure_s)
+
     # ------------------------------------------------------------------ 节拍器
     def _build_click_track(self, data: np.ndarray, sr: int) -> np.ndarray | None:
         """按节拍网格预生成节拍器音轨（小节头 1320Hz，其余 880Hz）。"""
@@ -1741,9 +1810,9 @@ class ScorePlayer:
                 return i
         return 0
 
-    def _highlight(self, note_ids: list[str], page: int) -> None:
+    def _highlight(self, note_ids: list[str], page: int, measure_id: str | None = None) -> None:
         self._clear_highlights()
-        if not note_ids or not self._page_positions:
+        if not self._page_positions:
             return
         centers: list[tuple[float, float]] = []  # canvas 坐标
         for pid in range(len(self._page_positions)):
@@ -1762,6 +1831,15 @@ class ScorePlayer:
                         fill="#e0245e", stipple="gray50",
                         tags=("hl",),
                     )
+                )
+            # 当前小节线（五线谱视图）
+            if measure_id and measure_id in positions:
+                mx, my = positions[measure_id]
+                lx = self.PAGE_GAP + mx * scale
+                y0 = self._page_y[pid] + (my - 600) * scale
+                y1 = self._page_y[pid] + (my + 600) * scale
+                self._highlight_items.append(
+                    self.canvas.create_line(lx, y0, lx, y1, fill="#4a90d9", width=2, tags=("hl",))
                 )
         if centers:
             self._scroll_to(centers[0][0], centers[0][1])
