@@ -43,11 +43,15 @@ class ScoreAssistantApp(tk.Tk):
         self._instruments: list[str] = []  # 空 = 自动检测
         self._all_instruments: list[str] = []
         self._last_out_dir: Path | None = None
+        self._audio_files: list[str] = []
+        self._running = False
 
         self._build_widgets()
         self._load_instrument_names()
+        self._restore_settings()
         self.after(50, self._refresh_env_async)
         self.after(100, self._poll_queue)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------ UI
     def _build_widgets(self) -> None:
@@ -202,14 +206,18 @@ class ScoreAssistantApp(tk.Tk):
     # ------------------------------------------------------------------ 对话框
     def _pick_audio(self) -> None:
         patterns = " ".join(f"*{s}" for s in sorted(AUDIO_SUFFIXES))
-        path = filedialog.askopenfilename(
-            title="选择音频文件",
+        paths = filedialog.askopenfilenames(
+            title="选择音频文件（可多选）",
             filetypes=[("音频文件", patterns), ("所有文件", "*.*")],
         )
-        if path:
-            self.audio_var.set(path)
-            if not self.out_var.get():
-                self.out_var.set(str(Path(path).with_suffix("")) + "_score")
+        if paths:
+            self._audio_files = list(paths)
+            if len(paths) == 1:
+                self.audio_var.set(paths[0])
+                if not self.out_var.get():
+                    self.out_var.set(str(Path(paths[0]).with_suffix("")) + "_score")
+            else:
+                self.audio_var.set(f"{paths[0]}（共 {len(paths)} 个文件）")
 
     def _pick_outdir(self) -> None:
         path = filedialog.askdirectory(title="选择输出目录")
@@ -315,6 +323,12 @@ class ScoreAssistantApp(tk.Tk):
 
     # ------------------------------------------------------------------ 运行
     def _start(self) -> None:
+        if self._running:  # 取消当前转录
+            for t in self._transcribers.values():
+                t.cancel()
+            self.status_label.config(text="正在取消…")
+            return
+
         source = self.audio_var.get().strip()
         url = source if source.startswith(("http://", "https://")) else ""
         audio = "" if url else source
@@ -322,10 +336,15 @@ class ScoreAssistantApp(tk.Tk):
             if "bilibili.com" not in url and "b23.tv" not in url:
                 messagebox.showerror("链接", "请输入有效的 B 站视频链接（bilibili.com 或 b23.tv）。")
                 return
-        elif not audio or not Path(audio).is_file():
-            messagebox.showerror("音频", "请输入存在的本地文件路径，或 B 站视频链接。")
-            return
-        default_out = str(Path(audio).with_suffix("")) + "_score" if audio else ""
+            self._audio_files = []
+        else:
+            if len(self._audio_files) <= 1:
+                self._audio_files = [audio] if audio else []
+            if not self._audio_files or not all(Path(f).is_file() for f in self._audio_files):
+                messagebox.showerror("音频", "请输入存在的本地文件路径，或 B 站视频链接。")
+                return
+        batch = len(self._audio_files) > 1
+        default_out = str(Path(self._audio_files[0]).with_suffix("")) + "_score" if self._audio_files else ""
         out_text = self.out_var.get().strip() or default_out
         out_dir = Path(out_text) if out_text else None  # 链接模式留空 → 下载后按标题生成
         want_sheets = self.sheets_var.get()
@@ -356,29 +375,51 @@ class ScoreAssistantApp(tk.Tk):
         transcriber = self._transcribers[size]
 
         self._log_clear()
-        self._log(f"链接：{url}" if url else f"音频：{audio}")
+        if url:
+            self._log(f"链接：{url}")
+        elif batch:
+            self._log(f"批量转录 {len(self._audio_files)} 个文件")
+        else:
+            self._log(f"音频：{self._audio_files[0] if self._audio_files else audio}")
         self._log(f"输出：{out_dir if out_dir else '（下载后按标题生成）'}")
         if self._instruments:
             self._log(f"乐器限定：{'、'.join(self._instruments)}")
-        self.start_btn.config(state=tk.DISABLED)
+        self._running = True
+        self.start_btn.config(text="取消", state=tk.NORMAL)
         self.open_btn.config(state=tk.DISABLED)
         self.progress.config(value=0, maximum=100)
         self.status_label.config(text="准备中…")
 
-        self._worker = threading.Thread(
-            target=run_in_thread,
-            args=(self.q, lambda: transcriber),
-            kwargs=dict(
-                bilibili_url=url or None,
-                audio_path=audio,
-                out_dir=out_dir,
-                want_sheets=want_sheets,
-                instruments=self._instruments or None,
-                cfg_coef=cfg,
-                detect_tempo=self.tempo_var.get(),
-            ),
-            daemon=True,
-        )
+        if batch:
+            from score_tool.worker import run_batch_in_thread
+
+            self._worker = threading.Thread(
+                target=run_batch_in_thread,
+                args=(self.q, lambda: transcriber, self._audio_files),
+                kwargs=dict(
+                    out_parent=str(out_dir) if out_dir else None,
+                    want_sheets=want_sheets,
+                    instruments=self._instruments or None,
+                    cfg_coef=cfg,
+                    detect_tempo=self.tempo_var.get(),
+                ),
+                daemon=True,
+            )
+        else:
+            self._worker = threading.Thread(
+                target=run_in_thread,
+                args=(self.q, lambda: transcriber),
+                kwargs=dict(
+                    bilibili_url=url or None,
+                    audio_path=audio or (self._audio_files[0] if self._audio_files else ""),
+                    out_dir=out_dir,
+                    want_sheets=want_sheets,
+                    instruments=self._instruments or None,
+                    cfg_coef=cfg,
+                    detect_tempo=self.tempo_var.get(),
+                ),
+                daemon=True,
+            )
         self._worker.start()
 
     def _poll_queue(self) -> None:
@@ -396,15 +437,27 @@ class ScoreAssistantApp(tk.Tk):
                     self._on_env(msg[1])
                 elif kind == "done":
                     self._on_done(msg[1])
+                elif kind == "cancelled":
+                    self._on_cancelled()
                 elif kind == "error":
                     self._on_error(msg[1])
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
 
+    def _finish_run(self, status: str) -> None:
+        self._running = False
+        for t in self._transcribers.values():
+            t.cancel_event.clear()
+        self.start_btn.config(text="开始转录", state=tk.NORMAL)
+        self.status_label.config(text=status)
+
+    def _on_cancelled(self) -> None:
+        self._finish_run("已取消")
+        self._log("已取消转录")
+
     def _on_done(self, result) -> None:
-        self.start_btn.config(state=tk.NORMAL)
-        self.status_label.config(text="完成")
+        self._finish_run("完成")
         self._last_out_dir = result.out_dir or Path(self.out_var.get())
         if result.out_dir is not None:
             self.out_var.set(str(result.out_dir))  # 链接模式：显示按标题生成的目录
@@ -425,14 +478,14 @@ class ScoreAssistantApp(tk.Tk):
                 first_onset_s=result.first_note_onset,
                 status_cb=lambda s: self.status_label.config(text=s),
                 midi_path=result.sheets_dir / "score.mid",
+                listen_midi=result.midi_path,
             )
         else:
             self.player.show_placeholder("本次未生成乐谱（转录时未勾选「生成乐谱」）")
             messagebox.showinfo("完成", f"转录完成！\nMIDI：{result.midi_path}")
 
     def _on_error(self, err: str) -> None:
-        self.start_btn.config(state=tk.NORMAL)
-        self.status_label.config(text="出错")
+        self._finish_run("出错")
         self._log(f"错误：{err}")
         hint = ""
         low = err.lower()
@@ -443,6 +496,49 @@ class ScoreAssistantApp(tk.Tk):
         messagebox.showerror("转录失败", err + hint)
 
     # ------------------------------------------------------------------ 小工具
+    def _restore_settings(self) -> None:
+        """恢复上次使用的设置。"""
+        s = envcheck.load_settings()
+        if s.get("model") in MODEL_SIZES:
+            self.model_var.set(s["model"])
+            self._update_model_hint()
+        if s.get("cfg"):
+            self.cfg_var.set(str(s["cfg"]))
+        if s.get("tempo") in TEMPO_MODES:
+            self.tempo_var.set(s["tempo"])
+        if s.get("out_dir"):
+            self.out_var.set(s["out_dir"])
+        if isinstance(s.get("instruments"), list) and s["instruments"]:
+            self._instruments = [n for n in s["instruments"] if isinstance(n, str)]
+            text = "、".join(self._instruments)
+            self.inst_label.config(text=text if len(text) <= 40 else f"已选 {len(self._instruments)} 种乐器")
+        if s.get("notation") in ("五线谱", "简谱", "吉他谱"):
+            self.player.notation_var.set(s["notation"])
+            self.player.notation = {"五线谱": "staff", "简谱": "jianpu", "吉他谱": "tab"}[s["notation"]]
+        if s.get("zoom"):
+            self.player.zoom_var.set(s["zoom"])
+            try:
+                self.player.zoom = int(s["zoom"].rstrip("%")) / 100.0
+            except ValueError:
+                pass
+
+    def _on_close(self) -> None:
+        """关闭时保存设置并清理资源。"""
+        envcheck.save_settings({
+            "model": self.model_var.get(),
+            "cfg": self.cfg_var.get(),
+            "tempo": self.tempo_var.get(),
+            "out_dir": self.out_var.get(),
+            "instruments": self._instruments,
+            "notation": self.player.notation_var.get(),
+            "zoom": self.player.zoom_var.get(),
+        })
+        try:
+            self.player.companion.set_enabled(False)
+        except Exception:
+            pass
+        self.destroy()
+
     def _update_model_hint(self) -> None:
         self.model_hint.config(text=MODEL_HINTS.get(self.model_var.get(), ""))
 

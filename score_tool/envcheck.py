@@ -48,6 +48,18 @@ def hf_token_present() -> bool:
     return HF_TOKEN_PATH.is_file() and bool(HF_TOKEN_PATH.read_text().strip())
 
 
+def load_settings() -> dict:
+    """读取用户设置（模型、输出目录等）。"""
+    return _load_config()
+
+
+def save_settings(updates: dict) -> None:
+    """合并写入用户设置。"""
+    cfg = _load_config()
+    cfg.update(updates)
+    _save_config(cfg)
+
+
 def save_hf_token(token: str) -> Path:
     """把 token 写入 ~/.cache/huggingface/token（等价于 `hf auth login`）。"""
     token = token.strip()

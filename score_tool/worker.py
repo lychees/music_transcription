@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import io
 import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -188,6 +189,10 @@ class _QueueWriter(io.TextIOBase):
         self._buf = ""
 
 
+class _Cancelled(Exception):
+    """用户取消转录。"""
+
+
 class ScoreTranscriber:
     """加载一次模型，可连续转录多个文件。"""
 
@@ -195,6 +200,10 @@ class ScoreTranscriber:
         self.model_size = model_size
         self._device = device
         self._model: TranscriptionModel | None = None
+        self.cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
 
     def load(self) -> None:
         if self._model is None:
@@ -252,6 +261,8 @@ class ScoreTranscriber:
             instruments=instruments or None,
         ):
             if isinstance(ev, ProgressEvent):
+                if self.cancel_event.is_set():
+                    raise _Cancelled
                 progress(ev.completed, ev.total)
             else:
                 events.append(ev)
@@ -336,6 +347,60 @@ def run_in_thread(
             )
         writer.flush()
         msg_queue.put(("done", result))
+    except _Cancelled:
+        writer.flush()
+        msg_queue.put(("cancelled",))
     except Exception as e:  # noqa: BLE001 —— 全部转交 GUI 显示
+        writer.flush()
+        msg_queue.put(("error", f"{type(e).__name__}: {e}"))
+
+
+def run_batch_in_thread(
+    msg_queue: "queue.Queue[tuple]",
+    make_transcriber: Callable[[], ScoreTranscriber],
+    files: list[str],
+    out_parent: str | None = None,
+    **kwargs,
+) -> None:
+    """批量转录：模型只加载一次，逐个文件处理；单个失败不影响后续。"""
+    writer = _QueueWriter(msg_queue)
+    try:
+        with contextlib.redirect_stderr(writer):
+            transcriber = make_transcriber()
+            msg_queue.put(("log", f"加载模型（{transcriber.model_size}）…首次使用需下载权重，请稍候"))
+            last = None
+            for i, f in enumerate(files, 1):
+                if transcriber.cancel_event.is_set():
+                    break
+                f = Path(f)
+                if out_parent:
+                    out_dir = Path(out_parent) / (f.stem + "_score")
+                else:
+                    out_dir = f.with_suffix("").parent / (f.stem + "_score")
+                msg_queue.put(("log", f"[{i}/{len(files)}] 转录：{f.name}"))
+                try:
+                    last = transcriber.transcribe(
+                        audio_path=f,
+                        out_dir=out_dir,
+                        on_progress=lambda d, t: msg_queue.put(("progress", d, t)),
+                        on_log=lambda s: msg_queue.put(("log", s)),
+                        **kwargs,
+                    )
+                    msg_queue.put(("log", f"[{i}/{len(files)}] 完成：{f.name}"))
+                except _Cancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    msg_queue.put(("log", f"[{i}/{len(files)}] 失败：{f.name} — {e}"))
+        writer.flush()
+        if last is not None:
+            msg_queue.put(("done", last))
+        elif not files:
+            msg_queue.put(("error", "没有可转录的文件"))
+        else:
+            msg_queue.put(("error", "全部文件转录失败，详见日志"))
+    except _Cancelled:
+        writer.flush()
+        msg_queue.put(("cancelled",))
+    except Exception as e:  # noqa: BLE001
         writer.flush()
         msg_queue.put(("error", f"{type(e).__name__}: {e}"))

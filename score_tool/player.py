@@ -344,6 +344,94 @@ def build_pitch_slots(tracks, beat_s: float) -> tuple[dict[int, list[tuple[int, 
     return slots, slot_s
 
 
+class MidiCompanion:
+    """MIDI 伴音：用系统 GM 合成器（pygame.midi）同步播放转录结果。
+
+    由播放循环驱动（pump(t) 每 ~30ms 调用一次），不另开线程；
+    事件时间轴为音频时间（未量化 MIDI），与播放位置直接对应。
+    """
+
+    def __init__(self) -> None:
+        self._out = None
+        self.events: list[tuple[float, str, int, int, int]] = []
+        self.idx = 0
+        self.enabled = False
+        self.time_offset = 0.0  # 事件时间轴与音频位置的差（量化 MIDI 时为 offset_s）
+
+    @staticmethod
+    def parse_events(midi_path: str | Path) -> list[tuple[float, str, int, int, int]]:
+        """解析 MIDI 为按秒排序的事件流 (t, kind, channel, a, b)。"""
+        import mido
+
+        midi = mido.MidiFile(str(midi_path))
+        tempo = 500000
+        evs: list[tuple[float, str, int, int, int]] = []
+        for track in midi.tracks:
+            t = 0.0
+            for msg in track:
+                t += mido.tick2second(msg.time, midi.ticks_per_beat, tempo)
+                if msg.type == "set_tempo":
+                    tempo = msg.tempo
+                elif msg.type == "program_change":
+                    evs.append((t, "prog", msg.channel, msg.program, 0))
+                elif msg.type == "note_on":
+                    evs.append((t, "on", msg.channel, msg.note, msg.velocity))
+                elif msg.type == "note_off":
+                    evs.append((t, "off", msg.channel, msg.note, 0))
+        evs.sort(key=lambda e: e[0])
+        return evs
+
+    def _ensure_out(self) -> bool:
+        if self._out is not None:
+            return True
+        try:
+            import os
+
+            os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+            import pygame.midi
+
+            pygame.midi.init()
+            self._pygame_midi = pygame.midi
+            self._out = pygame.midi.Output(pygame.midi.get_default_output_id())
+            return True
+        except Exception:
+            self._out = None
+            return False
+
+    def set_enabled(self, on: bool) -> None:
+        if on and not self._ensure_out():
+            self.enabled = False
+            return
+        self.enabled = on
+        if not on:
+            self.all_off()
+
+    def all_off(self) -> None:
+        if self._out is not None:
+            for ch in range(16):
+                self._out.write_short(0xB0 | ch, 123, 0)  # All Notes Off
+
+    def seek(self, t: float) -> None:
+        from bisect import bisect_left
+
+        times = [e[0] for e in self.events]
+        self.idx = bisect_left(times, t)
+        self.all_off()
+
+    def pump(self, t: float) -> None:
+        if not self.enabled or self._out is None:
+            return
+        while self.idx < len(self.events) and self.events[self.idx][0] <= t:
+            _, kind, ch, a, b = self.events[self.idx]
+            if kind == "prog":
+                self._out.set_instrument(a, ch)
+            elif kind == "on" and b > 0:
+                self._out.note_on(a, b, ch)
+            else:  # off，或 velocity==0 的 on
+                self._out.note_off(a, 0, ch)
+            self.idx += 1
+
+
 class GuitarBoard:
     """吉他/贝斯指板演示：点亮当前按下的 (弦, 品位)。"""
 
@@ -526,6 +614,7 @@ class ScorePlayer:
         self._slot_s = 0.125
         self._boards: list = []  # GuitarBoard 列表（按 TAB 声部）
         self._last_fit: float | None = None  # 上次渲染的可用宽度（tab 显示时校验重排用）
+        self.companion = MidiCompanion()
 
         self._build_ui()
         self.show_placeholder("转录完成后，乐谱会显示在这里")
@@ -547,7 +636,7 @@ class ScorePlayer:
 
     def _seek_rel(self, delta: float) -> None:
         if self.audio is not None and not self._focus_is_text_input():
-            self.audio.seek_seconds(self.audio.position_seconds() + delta)
+            self._seek_to(self.audio.position_seconds() + delta)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -595,6 +684,11 @@ class ScorePlayer:
         )
         self.export_tab_btn.pack(side=tk.LEFT, padx=6)
         ttk.Button(bar, text="打开乐谱…", command=self._open_existing, width=9).pack(side=tk.LEFT, padx=2)
+        self.midi_var = tk.BooleanVar(value=False)
+        self.midi_check = ttk.Checkbutton(
+            bar, text="MIDI 伴音", variable=self.midi_var, command=self._toggle_companion
+        )
+        self.midi_check.pack(side=tk.LEFT, padx=6)
 
         # —— 和弦提示条 ——
         chord_bar = ttk.Frame(self.frame)
@@ -658,8 +752,13 @@ class ScorePlayer:
         first_onset_s: float | None = None,
         status_cb=None,
         midi_path: str | Path | None = None,
+        listen_midi: str | Path | None = None,
     ) -> None:
-        """后台线程加载乐谱与音频，完成后在 GUI 线程逐页渲染。"""
+        """后台线程加载乐谱与音频，完成后在 GUI 线程逐页渲染。
+
+        listen_midi：用于「MIDI 伴音」的 MIDI 文件（未量化优先；
+        量化 score.mid 会按谱面时间偏移处理）。
+        """
         import queue as _queue
 
         self._status_cb = status_cb or (lambda s: None)
@@ -683,6 +782,8 @@ class ScorePlayer:
                 jp = None
                 tab = None
                 pitch_slots, tab_slots, slot_s = {}, {}, 0.125
+                listen_evs: list | None = None
+                listen_quantized = False
                 if midi_path and Path(midi_path).is_file():
                     from score_tool.chords import detect_chords, estimate_key, parse_midi_notes
                     from score_tool.jianpu import JianpuScore
@@ -696,7 +797,18 @@ class ScorePlayer:
                     pitch_slots, slot_s = build_pitch_slots(jp.tracks, 60.0 / bpm)
                     if tab.tracks:
                         tab_slots, _ = tab.build_tab_slots(60.0 / bpm)
-                self._load_q.put(("ready", model, data, sr, offset, chords, key, jp, tab, pitch_slots, tab_slots, slot_s))
+                for cand, quant in ((listen_midi, False), (midi_path, True)):
+                    if cand and Path(cand).is_file():
+                        try:
+                            listen_evs = MidiCompanion.parse_events(cand)
+                            listen_quantized = quant
+                            break
+                        except Exception:
+                            continue
+                self._load_q.put(
+                    ("ready", model, data, sr, offset, chords, key, jp, tab,
+                     pitch_slots, tab_slots, slot_s, listen_evs, listen_quantized)
+                )
             except Exception as e:  # noqa: BLE001
                 self._load_q.put(("error", e))
 
@@ -719,7 +831,7 @@ class ScorePlayer:
         else:
             self.show_placeholder(f"乐谱加载失败：{payload[0]}")
 
-    def _on_model_ready(self, model, data, sr, offset, chords, key, jp, tab, pitch_slots, tab_slots, slot_s) -> None:
+    def _on_model_ready(self, model, data, sr, offset, chords, key, jp, tab, pitch_slots, tab_slots, slot_s, listen_evs, listen_quantized) -> None:
         self.stop()
         self.model = model
         self.audio = AudioPlayer(data, sr)
@@ -736,6 +848,15 @@ class ScorePlayer:
         self._slot_s = slot_s
         self._cur_chord_idx = -1
         self.key_label.config(text=f"调性：{key}" if key else "")
+        # MIDI 伴音
+        self.companion.events = listen_evs or []
+        self.companion.idx = 0
+        self.companion.time_offset = offset if listen_quantized else 0.0
+        self.midi_check.config(
+            state=self._tk.NORMAL if listen_evs else self._tk.DISABLED
+        )
+        if not listen_evs:
+            self.midi_var.set(False)
         self.export_tab_btn.config(
             state=self._tk.NORMAL if (tab is not None and tab.tracks) else self._tk.DISABLED
         )
@@ -785,7 +906,7 @@ class ScorePlayer:
         char = int(self.chord_strip.index(f"@{e.x},{e.y}").split(".")[1])
         for i, (s, en) in enumerate(self._strip_char_ranges):
             if s <= char < en:
-                self.audio.seek_seconds(self.chord_spans[i].start + self.offset_s)
+                self._seek_to(self.chord_spans[i].start + self.offset_s)
                 return
 
     def _render_pages(self, status=lambda s: None) -> None:
@@ -1054,6 +1175,7 @@ class ScorePlayer:
             self.audio.pause()
             self.play_btn.config(text="▶ 播放")
             self.keyboard.clear()
+            self.companion.all_off()
             for b in self._boards:
                 b.clear()
         else:
@@ -1067,6 +1189,7 @@ class ScorePlayer:
         self._clear_highlights()
         self._update_transport(0.0)
         self.keyboard.clear()
+        self.companion.seek(0.0)
         for b in self._boards:
             b.clear()
         # 和弦提示复位
@@ -1081,12 +1204,18 @@ class ScorePlayer:
         self.offset_s += delta
         self.offset_label.config(text=f"{round(self.offset_s * 1000):+d}ms")
 
+    def _seek_to(self, s: float) -> None:
+        if self.audio is None:
+            return
+        self.audio.seek_seconds(s)
+        self.companion.seek(self.audio.position_seconds() - self.companion.time_offset)
+
     def _on_seek_release(self, _e) -> None:
         self._seek_dragging = False
         if self.audio is None:
             return
         frac = float(self.progress.get()) / 1000.0
-        self.audio.seek_seconds(frac * self.audio.duration)
+        self._seek_to(frac * self.audio.duration)
 
     def _on_zoom(self) -> None:
         try:
@@ -1115,6 +1244,7 @@ class ScorePlayer:
             self.audio.pos = 0
             self.play_btn.config(text="▶ 播放")
             self._clear_highlights()
+            self.companion.all_off()
         pos_s = self.audio.position_seconds()
         self._update_transport(pos_s)
         if self.audio.playing:
@@ -1129,6 +1259,7 @@ class ScorePlayer:
             self._update_chord_display(score_ms / 1000.0)
             self._update_keyboard(score_ms / 1000.0)
             self._update_boards(score_ms / 1000.0)
+            self.companion.pump(pos_s - self.companion.time_offset)
         self.root.after(30, self._tick)
 
     def _update_boards(self, score_s: float) -> None:
@@ -1158,6 +1289,13 @@ class ScorePlayer:
             self.kb_frame.pack(side=self._tk.BOTTOM, fill=self._tk.X)
         else:
             self.kb_frame.pack_forget()
+
+    def _toggle_companion(self) -> None:
+        on = self.midi_var.get()
+        self.companion.set_enabled(on)
+        if on and not self.companion.enabled:
+            self.midi_var.set(False)
+            self._status_cb("MIDI 伴音不可用：没有 MIDI 输出设备")
 
     def _highlight_tab(self, score_s: float) -> None:
         self._clear_highlights()
@@ -1300,7 +1438,7 @@ class ScorePlayer:
                 if d < best_d:
                     best, best_d = g, d
             if best is not None:
-                self.audio.seek_seconds(best.start_s + self.offset_s)
+                self._seek_to(best.start_s + self.offset_s)
             return
         if self.notation == "tab":
             if self._tab_layout is None:
@@ -1312,7 +1450,7 @@ class ScorePlayer:
                 if d < best_d:
                     best, best_d = g, d
             if best is not None:
-                self.audio.seek_seconds(best.start_s + self.offset_s)
+                self._seek_to(best.start_s + self.offset_s)
             return
         if not self._page_positions:
             return
@@ -1331,4 +1469,4 @@ class ScorePlayer:
             return
         t = self.model.time_for_element(best)
         if t is not None:
-            self.audio.seek_seconds(t / 1000.0 + self.offset_s)
+            self._seek_to(t / 1000.0 + self.offset_s)
