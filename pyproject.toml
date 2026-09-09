@@ -5,6 +5,7 @@ description = "听曲目生成乐谱的辅助工具（基于 MuScriptor 多乐�
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "muscriptor",
+    "pedalboard>=0.9.24",
     "pillow>=12.3.0",
     "pygame>=2.6.1",
     "pyside6>=6.11.2",

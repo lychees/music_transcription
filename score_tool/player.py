@@ -615,6 +615,24 @@ class ScorePlayer:
         self._boards: list = []  # GuitarBoard 列表（按 TAB 声部）
         self._last_fit: float | None = None  # 上次渲染的可用宽度（tab 显示时校验重排用）
         self.companion = MidiCompanion()
+        # —— 练习功能状态 ——
+        self.rate = 1.0  # 播放速率（0.75 = 慢速，输出变长；原始时间 = 流位置 × rate）
+        self._stretched: dict[float, np.ndarray] = {}
+        self._stretching = False
+        self._rate_pending = None
+        self._stretch_result = None
+        self._audio_data = None
+        self._audio_sr = 0
+        self._mix_data = None  # 混入节拍器后的音频（未混为 None）
+        self._click_track = None
+        self._countin_buf = None
+        self._countin_player = None
+        self._countin_done_pending = False
+        self._loop_a: float | None = None
+        self._loop_b: float | None = None
+        self._beat_s: float | None = None
+        self._bpb: int | None = None
+        self._measure_s: float | None = None
 
         self._build_ui()
         self.show_placeholder("转录完成后，乐谱会显示在这里")
@@ -689,6 +707,32 @@ class ScorePlayer:
             bar, text="MIDI 伴音", variable=self.midi_var, command=self._toggle_companion
         )
         self.midi_check.pack(side=tk.LEFT, padx=6)
+
+        # —— 练习工具条 ——
+        pr = ttk.Frame(self.frame)
+        pr.pack(fill=tk.X, padx=6, pady=(0, 2))
+        ttk.Label(pr, text="速度：").pack(side=tk.LEFT)
+        self.speed_var = tk.StringVar(value="1.0x")
+        spd = ttk.Combobox(
+            pr, textvariable=self.speed_var, width=6, state="readonly",
+            values=("0.5x", "0.6x", "0.7x", "0.75x", "0.8x", "0.85x", "0.9x", "0.95x", "1.0x", "1.25x", "1.5x"),
+        )
+        spd.pack(side=tk.LEFT, padx=2)
+        spd.bind("<<ComboboxSelected>>", lambda _e: self._on_speed())
+        ttk.Label(pr, text="AB循环：").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Button(pr, text="设 A", width=5, command=self._set_loop_a).pack(side=tk.LEFT)
+        ttk.Button(pr, text="设 B", width=5, command=self._set_loop_b).pack(side=tk.LEFT, padx=2)
+        ttk.Button(pr, text="清除", width=5, command=self._clear_loop).pack(side=tk.LEFT)
+        self.loop_label = ttk.Label(pr, text="—", foreground="#666")
+        self.loop_label.pack(side=tk.LEFT, padx=6)
+        ttk.Button(pr, text="◀ 小节", width=7, command=lambda: self._seek_measure(-1)).pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Button(pr, text="小节 ▶", width=7, command=lambda: self._seek_measure(1)).pack(side=tk.LEFT)
+        self.metro_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pr, text="节拍器", variable=self.metro_var, command=self._toggle_metronome).pack(side=tk.LEFT, padx=(10, 2))
+        self.countin_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pr, text="预备拍", variable=self.countin_var).pack(side=tk.LEFT, padx=2)
+        self.stepup_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pr, text="阶梯提速", variable=self.stepup_var).pack(side=tk.LEFT, padx=2)
 
         # —— 和弦提示条 ——
         chord_bar = ttk.Frame(self.frame)
@@ -778,6 +822,17 @@ class ScorePlayer:
                 onset = first_onset_s if first_onset_s is not None else estimate_first_onset(data, sr)
                 first_ms = model.first_note_time_ms()
                 offset = onset - first_ms / 1000.0
+                # 预生成练习常用的慢速版（快速模式，避免变速时等待）
+                pre_stretched = {}
+                try:
+                    from pedalboard import time_stretch
+
+                    for pre_r in (0.5, 0.75):
+                        pre_stretched[pre_r] = time_stretch(
+                            data.T, sr, stretch_factor=pre_r, high_quality=False
+                        ).T.astype(np.float32)
+                except Exception:
+                    pre_stretched = {}
                 chords, key = [], ""
                 jp = None
                 tab = None
@@ -807,7 +862,7 @@ class ScorePlayer:
                             continue
                 self._load_q.put(
                     ("ready", model, data, sr, offset, chords, key, jp, tab,
-                     pitch_slots, tab_slots, slot_s, listen_evs, listen_quantized)
+                     pitch_slots, tab_slots, slot_s, listen_evs, listen_quantized, pre_stretched)
                 )
             except Exception as e:  # noqa: BLE001
                 self._load_q.put(("error", e))
@@ -831,7 +886,7 @@ class ScorePlayer:
         else:
             self.show_placeholder(f"乐谱加载失败：{payload[0]}")
 
-    def _on_model_ready(self, model, data, sr, offset, chords, key, jp, tab, pitch_slots, tab_slots, slot_s, listen_evs, listen_quantized) -> None:
+    def _on_model_ready(self, model, data, sr, offset, chords, key, jp, tab, pitch_slots, tab_slots, slot_s, listen_evs, listen_quantized, pre_stretched) -> None:
         self.stop()
         self.model = model
         self.audio = AudioPlayer(data, sr)
@@ -848,6 +903,20 @@ class ScorePlayer:
         self._slot_s = slot_s
         self._cur_chord_idx = -1
         self.key_label.config(text=f"调性：{key}" if key else "")
+        # —— 练习功能初始化 ——
+        self._audio_data = data
+        self._audio_sr = sr
+        self._stretched = {1.0: data, **(pre_stretched or {})}
+        self.rate = 1.0
+        self.speed_var.set("1.0x")
+        self._mix_data = None
+        self._loop_a = self._loop_b = None
+        self._update_loop_label()
+        self._beat_s = jp.beat_s if jp else None
+        self._bpb = jp.bpb if jp else None
+        self._measure_s = jp.measure_s if jp else None
+        self._click_track = self._build_click_track(data, sr)
+        self._countin_buf = self._build_countin(sr)
         # MIDI 伴音
         self.companion.events = listen_evs or []
         self.companion.idx = 0
@@ -1179,10 +1248,19 @@ class ScorePlayer:
             for b in self._boards:
                 b.clear()
         else:
-            self.audio.play()
-            self.play_btn.config(text="⏸ 暂停")
+            if self._countin_player is not None:  # 预备拍中途再按 = 开始播放
+                self._countin_player.pause()
+                self._countin_player = None
+            if self.countin_var.get() and self._countin_buf is not None:
+                self._start_countin()
+            else:
+                self.audio.play()
+                self.play_btn.config(text="⏸ 暂停")
 
     def stop(self) -> None:
+        if self._countin_player is not None:
+            self._countin_player.pause()
+            self._countin_player = None
         if self.audio is not None:
             self.audio.stop()
         self.play_btn.config(text="▶ 播放")
@@ -1207,8 +1285,8 @@ class ScorePlayer:
     def _seek_to(self, s: float) -> None:
         if self.audio is None:
             return
-        self.audio.seek_seconds(s)
-        self.companion.seek(self.audio.position_seconds() - self.companion.time_offset)
+        self.audio.seek_seconds(s / self.rate)
+        self.companion.seek(self.audio.position_seconds() * self.rate - self.companion.time_offset)
 
     def _on_seek_release(self, _e) -> None:
         self._seek_dragging = False
@@ -1238,6 +1316,22 @@ class ScorePlayer:
         if self.audio is None or self.model is None:
             self._timer_on = False
             return
+        if self._stretch_result is not None:  # 后台变速处理完成
+            r, out = self._stretch_result
+            self._stretch_result = None
+            if out is None:
+                self._status_cb("变速处理失败")
+                self.speed_var.set(f"{self.rate:g}x")
+            else:
+                self._stretched[r] = out
+                old_orig, was_playing = self._rate_pending
+                self._rate_pending = None
+                self._apply_rate(r, old_orig, was_playing)
+        if self._countin_done_pending:  # 预备拍结束，正式播放
+            self._countin_done_pending = False
+            self._countin_player = None
+            self.audio.play()
+            self.play_btn.config(text="⏸ 暂停")
         if self._eof_pending:
             self._eof_pending = False
             self.audio.pause()
@@ -1245,9 +1339,23 @@ class ScorePlayer:
             self.play_btn.config(text="▶ 播放")
             self._clear_highlights()
             self.companion.all_off()
-        pos_s = self.audio.position_seconds()
+        pos_s = self._orig_pos()
         self._update_transport(pos_s)
         if self.audio.playing:
+            # AB 循环（含阶梯提速）
+            if (
+                self._loop_a is not None
+                and self._loop_b is not None
+                and self._loop_b > self._loop_a
+                and pos_s >= self._loop_b
+            ):
+                self._seek_to(self._loop_a)
+                if self.stepup_var.get():
+                    new_rate = min(self.rate + 0.1, 1.0)
+                    if new_rate != self.rate:
+                        self.speed_var.set(f"{new_rate:g}x")
+                        self._set_rate(new_rate)
+                pos_s = self._loop_a
             score_ms = (pos_s - self.offset_s) * 1000.0
             el = self.model.elements_at(score_ms)
             if self.notation == "jianpu":
@@ -1362,14 +1470,164 @@ class ScorePlayer:
         if item is not None:
             self.canvas.itemconfig(item, fill="#e0245e")
 
+    def _orig_pos(self) -> float:
+        """当前播放位置（原始时间，秒）。变速时流位置 × rate。"""
+        return self.audio.position_seconds() * self.rate if self.audio else 0.0
+
+    def _orig_dur(self) -> float:
+        """音频总长（原始时间，秒）。"""
+        return self.audio.duration * self.rate if self.audio else 0.0
+
     def _update_transport(self, pos_s: float) -> None:
         if self.audio is None:
             return
-        dur = self.audio.duration
+        dur = self._orig_dur()
         fmt = lambda s: f"{int(s // 60)}:{int(s % 60):02d}"
         self.time_label.config(text=f"{fmt(pos_s)} / {fmt(dur)}")
         if not self._seek_dragging and dur > 0:
             self.progress.set(pos_s / dur * 1000.0)
+
+    # ------------------------------------------------------------------ 变速
+    def _on_speed(self) -> None:
+        try:
+            self._set_rate(float(self.speed_var.get().rstrip("x")))
+        except ValueError:
+            pass
+
+    def _set_rate(self, r: float) -> None:
+        if self.audio is None or r == self.rate or self._stretching:
+            return
+        old_orig = self._orig_pos()
+        was_playing = self.audio.playing
+        self.audio.pause()
+        if r not in self._stretched:
+            self._stretching = True
+            self._rate_pending = (old_orig, was_playing)
+            self._stretch_result = None
+            self._status_cb(f"变速处理中（{r:g}x）…")
+
+            def work():
+                try:
+                    from pedalboard import time_stretch
+
+                    src = self._mix_data if self._mix_data is not None else self._audio_data
+                    out = time_stretch(src.T, self._audio_sr, stretch_factor=r, high_quality=False).T
+                    self._stretch_result = (r, out.astype(np.float32))
+                except Exception:
+                    self._stretch_result = (r, None)
+                self._stretching = False
+
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self._apply_rate(r, old_orig, was_playing)
+
+    def _apply_rate(self, r: float, old_orig: float, was_playing: bool) -> None:
+        self.rate = r
+        self.audio = AudioPlayer(self._stretched[r], self._audio_sr)
+        self.audio.on_eof = lambda: setattr(self, "_eof_pending", True)
+        self._seek_to(old_orig)
+        self._update_transport(old_orig)
+        if was_playing:
+            self.audio.play()
+        self._status_cb(f"速度 {r:g}x")
+
+    # ------------------------------------------------------------------ AB 循环
+    def _set_loop_a(self) -> None:
+        if self.audio is not None:
+            self._loop_a = self._orig_pos()
+            self._update_loop_label()
+
+    def _set_loop_b(self) -> None:
+        if self.audio is not None:
+            self._loop_b = self._orig_pos()
+            self._update_loop_label()
+
+    def _clear_loop(self) -> None:
+        self._loop_a = self._loop_b = None
+        self._update_loop_label()
+
+    def _update_loop_label(self) -> None:
+        fmt = lambda s: f"{int(s // 60)}:{int(s % 60):02d}"
+        if self._loop_a is not None and self._loop_b is not None and self._loop_b > self._loop_a:
+            self.loop_label.config(text=f"A {fmt(self._loop_a)} ⇄ B {fmt(self._loop_b)}")
+        elif self._loop_a is not None:
+            self.loop_label.config(text=f"A {fmt(self._loop_a)}（未设 B）")
+        else:
+            self.loop_label.config(text="—")
+
+    def _seek_measure(self, d: int) -> None:
+        """前/后跳一小节（按测得的小节长度）。"""
+        if self.audio is None or not self._measure_s:
+            return
+        cur = self._orig_pos()
+        target = math.floor(cur / self._measure_s) * self._measure_s + d * self._measure_s
+        self._seek_to(max(0.0, target))
+
+    # ------------------------------------------------------------------ 节拍器
+    def _build_click_track(self, data: np.ndarray, sr: int) -> np.ndarray | None:
+        """按节拍网格预生成节拍器音轨（小节头 1320Hz，其余 880Hz）。"""
+        if not self._beat_s or not self.offset_s and self.offset_s is None:
+            return None
+        n, ch = data.shape
+        click = np.zeros_like(data)
+        t = np.arange(int(0.03 * sr)) / sr
+        tone_b = (np.sin(2 * np.pi * 880 * t) * np.exp(-t * 80)).astype(np.float32)
+        tone_a = (np.sin(2 * np.pi * 1320 * t) * np.exp(-t * 80)).astype(np.float32)
+        bpb = self._bpb or 4
+        t_beat, k = self.offset_s, 0
+        end_s = n / sr
+        while t_beat < end_s:
+            i0 = int(t_beat * sr)
+            tone = tone_a if k % bpb == 0 else tone_b
+            seg = click[i0 : i0 + len(tone)]
+            if len(seg) < len(tone):
+                break
+            for c in range(ch):
+                seg[:, c] += tone[: len(seg)]
+            t_beat += self._beat_s
+            k += 1
+        return click
+
+    def _toggle_metronome(self) -> None:
+        if self.audio is None:
+            return
+        orig = self._orig_pos()
+        playing = self.audio.playing
+        self.audio.pause()
+        self._mix_data = (
+            (self._audio_data + self._click_track * 0.25).astype(np.float32)
+            if self.metro_var.get() and self._click_track is not None
+            else None
+        )
+        src = self._mix_data if self._mix_data is not None else self._audio_data
+        self._stretched = {1.0: src}
+        if self.rate != 1.0:
+            r = self.rate
+            self.rate = 1.0
+            self._set_rate(r)
+        else:
+            self._apply_rate(1.0, orig, playing)
+
+    # ------------------------------------------------------------------ 预备拍
+    def _build_countin(self, sr: int) -> np.ndarray | None:
+        """一小节预备拍音频（首拍重音）。"""
+        if not self._beat_s:
+            return None
+        bpb = self._bpb or 4
+        buf = np.zeros((int(bpb * self._beat_s * sr), 1), dtype=np.float32)
+        t = np.arange(int(0.03 * sr)) / sr
+        for k in range(bpb):
+            f = 1320 if k == 0 else 880
+            tone = (np.sin(2 * np.pi * f * t) * np.exp(-t * 80)).astype(np.float32)
+            i0 = int(k * self._beat_s * sr)
+            buf[i0 : i0 + len(tone), 0] += tone
+        return buf
+
+    def _start_countin(self) -> None:
+        self._countin_player = AudioPlayer(self._countin_buf, self._audio_sr)
+        self._countin_player.on_eof = lambda: setattr(self, "_countin_done_pending", True)
+        self._countin_player.play()
+        self.play_btn.config(text="预备拍…")
 
     def _page_of_y(self, y_canvas: float) -> int:
         for i in range(len(self._page_y) - 1, -1, -1):
