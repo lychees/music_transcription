@@ -282,12 +282,16 @@ class PianoKeyboard:
         self._drawn_w = w
         self.canvas.delete("all")
         self._items.clear()
+        self._key_center: dict[int, float] = {}
+        self._key_w: dict[int, float] = {}
         whites = [p for p in range(self.FIRST, self.LAST + 1) if p % 12 in _WHITE_PC]
         wk_w = w / len(whites)
         white_x: dict[int, tuple[float, float]] = {}
         for i, p in enumerate(whites):
             x0 = i * wk_w
             white_x[p] = (x0, wk_w)
+            self._key_center[p] = x0 + wk_w / 2
+            self._key_w[p] = wk_w
             self._items[p] = self.canvas.create_rectangle(
                 x0, 0, x0 + wk_w, h, fill="white", outline="#999999"
             )
@@ -304,6 +308,8 @@ class PianoKeyboard:
                 continue
             x0, wk = white_x[below]
             bx = x0 + wk - wk * 0.3
+            self._key_center[p] = bx + wk * 0.3
+            self._key_w[p] = wk * 0.6
             self._items[p] = self.canvas.create_rectangle(
                 bx, 0, bx + wk * 0.6, h * 0.62, fill="#222222", outline="#000000"
             )
@@ -430,6 +436,83 @@ class MidiCompanion:
             else:  # off，或 velocity==0 的 on
                 self._out.note_off(a, 0, ch)
             self.idx += 1
+
+
+class NoteHighway:
+    """音符瀑布流：未来 WINDOW_S 秒要弹的音从上方落下，过"现在"线即点亮。
+
+    x 轴与 PianoKeyboard 的键位一一对齐（画布等宽、同源键位几何）。
+    """
+
+    WINDOW_S = 4.0
+
+    def __init__(self, tk_mod, parent, keyboard, height: int = 170):
+        self._tk = tk_mod
+        self.keyboard = keyboard
+        self.height = height
+        self.canvas = tk_mod.Canvas(parent, height=height, bg="#1c1c22", highlightthickness=0)
+        self.canvas.pack(fill=tk_mod.X)
+        self._items: dict[tuple, tuple] = {}  # note -> (rect, )
+        self._notes: list[tuple[float, float, int, int]] = []
+        self.canvas.bind("<Configure>", lambda _e: self._draw_static())
+        self._draw_static()
+
+    def set_notes(self, notes: list[tuple[float, float, int, int]]) -> None:
+        """(start_s, end_s, pitch, track_idx)，谱面时间。"""
+        self._notes = notes
+        for rect, in self._items.values():
+            self.canvas.delete(rect)
+        self._items.clear()
+        self._draw_static()
+
+    def _draw_static(self) -> None:
+        self.canvas.delete("static")
+        now_y = self.height - 26
+        self.canvas.create_line(0, now_y, self.canvas.winfo_width() or 800, now_y,
+                                fill="#e0245e", width=2, tags="static")
+
+    def update(self, score_s: float) -> None:
+        kb = self.keyboard
+        if not self._notes or not getattr(kb, "_key_center", None):
+            return
+        now_y = self.height - 26
+        scale = (self.height - 40) / self.WINDOW_S
+        lo, hi = score_s - 0.3, score_s + self.WINDOW_S
+
+        # 移除已过去的音符
+        past = [n for n, (rect,) in self._items.items() if n[1] < lo]
+        for n in past:
+            self.canvas.delete(self._items[n][0])
+            del self._items[n]
+        # 添加进入窗口的音符
+        for n in self._notes:
+            st, en, p, ti = n
+            if en < lo or st > hi or n in self._items:
+                continue
+            x = kb._key_center.get(p)
+            if x is None:
+                continue
+            w = kb._key_w.get(p, 8.0) * 0.85
+            rect = self.canvas.create_rectangle(
+                x - w / 2, 0, x + w / 2, 0,
+                fill=KB_PALETTE[ti % len(KB_PALETTE)], outline="", width=0,
+            )
+            self._items[n] = (rect,)
+        # 更新位置与当前高亮
+        for n, (rect,) in self._items.items():
+            st, en, _p, _ti = n
+            y1 = now_y - (st - score_s) * scale
+            y0 = now_y - (en - score_s) * scale
+            coords = self.canvas.coords(rect)
+            if coords:
+                self.canvas.coords(rect, coords[0], min(y0, y1 - 2), coords[2], max(y1, y0 + 2))
+            if st <= score_s < en:
+                self.canvas.itemconfigure(rect, outline="white", width=1)
+            else:
+                self.canvas.itemconfigure(rect, outline="", width=0)
+
+    def clear(self) -> None:
+        self.set_notes([])
 
 
 class GuitarBoard:
@@ -763,6 +846,10 @@ class ScorePlayer:
             chord_bar, text="吉他指板", variable=self.gb_var, command=self._toggle_boards
         )
         self.gb_check.pack(side=tk.RIGHT, padx=4)
+        self.hw_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            chord_bar, text="瀑布流", variable=self.hw_var, command=self._toggle_highway
+        ).pack(side=tk.RIGHT, padx=4)
 
         self.canvas = tk.Canvas(self.frame, bg="#888888", highlightthickness=0)
         hscroll = ttk.Scrollbar(self.frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
@@ -772,6 +859,9 @@ class ScorePlayer:
         self.kb_frame = ttk.Frame(self.frame)
         self.kb_frame.pack(side=tk.BOTTOM, fill=tk.X)
         self.keyboard = PianoKeyboard(tk, self.kb_frame)
+        self.hw_frame = ttk.Frame(self.frame)
+        self.hw_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self.highway = NoteHighway(tk, self.hw_frame, self.keyboard)
         vscroll = ttk.Scrollbar(self.frame, orient=tk.VERTICAL, command=self.canvas.yview)
         vscroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.configure(yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
@@ -917,6 +1007,15 @@ class ScorePlayer:
         self._measure_s = jp.measure_s if jp else None
         self._click_track = self._build_click_track(data, sr)
         self._countin_buf = self._build_countin(sr)
+        # 瀑布流音符（谱面时间，跳过鼓声部）
+        highway_notes = []
+        if jp:
+            for ti, track in enumerate(jp.tracks):
+                if getattr(track, "is_drum", False):
+                    continue
+                for start, end, pitch in track.notes:
+                    highway_notes.append((start, end, pitch, ti))
+        self.highway.set_notes(highway_notes)
         # MIDI 伴音
         self.companion.events = listen_evs or []
         self.companion.idx = 0
@@ -1367,8 +1466,15 @@ class ScorePlayer:
             self._update_chord_display(score_ms / 1000.0)
             self._update_keyboard(score_ms / 1000.0)
             self._update_boards(score_ms / 1000.0)
+            self.highway.update(score_ms / 1000.0)
             self.companion.pump(pos_s - self.companion.time_offset)
         self.root.after(30, self._tick)
+
+    def _toggle_highway(self) -> None:
+        if self.hw_var.get():
+            self.hw_frame.pack(side=self._tk.BOTTOM, fill=self._tk.X)
+        else:
+            self.hw_frame.pack_forget()
 
     def _update_boards(self, score_s: float) -> None:
         if not self._boards or not self._tab_slots:
