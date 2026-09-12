@@ -13,6 +13,7 @@ dependencies = [
     "torch==2.7.1 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "torchaudio==2.7.1 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "verovio>=6.3.0",
+    "yt-dlp>=2026.8.19",
 ]
 
 # Windows/Linux 下从 PyTorch 官方 cu128 源安装 CUDA 版 torch；

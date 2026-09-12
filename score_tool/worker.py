@@ -98,6 +98,98 @@ def _bili_resolve_bvid(url: str, log: LogCb) -> tuple[str, dict | None, int]:
     raise ValueError("无法从链接中解析视频号（BV/av）")
 
 
+def download_youtube(url: str, out_dir: str | Path, on_log: LogCb | None = None) -> Path:
+    """用 yt-dlp 下载 YouTube 视频音轨并转成 wav，返回文件路径（重复下载直接复用）。
+
+    YouTube 对数据中心 IP 常触发人机验证，按以下顺序尝试：
+    cookies.txt（项目根目录或 downloads/）→ 浏览器 cookies → 免 cookies 直连。
+    """
+    from yt_dlp import YoutubeDL
+
+    log = on_log or (lambda s: None)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    attempts: list[tuple[str, object]] = []
+    for cf in (Path("cookies.txt"), Path("downloads/cookies.txt")):
+        if cf.is_file():
+            attempts.append(("cookiefile", cf))
+            break
+    for browser in ("chrome", "edge", "firefox"):
+        attempts.append(("browser", browser))
+    attempts.append(("plain", None))
+
+    info = None
+    last_err: Exception | None = None
+    win_opts: dict = {}
+    for kind, val in attempts:
+        opts: dict = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
+        if kind == "cookiefile":
+            opts["cookiefile"] = str(val)
+            log(f"尝试用 cookies.txt：{val}")
+        elif kind == "browser":
+            opts["cookiesfrombrowser"] = (val,)
+            log(f"尝试读取 {val} 浏览器 cookies…")
+        else:
+            log("尝试免 cookies 直连…")
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            win_opts = opts
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    if info is None:
+        raise RuntimeError(
+            "YouTube 拒绝了当前 IP 的访问（人机验证）。解决办法：\n"
+            "1. 用浏览器扩展（如 Get cookies.txt LOCALLY）导出 YouTube 的 cookies.txt，"
+            "放到项目根目录或 downloads/ 下后重试；\n"
+            "2. 或配置代理（HTTPS_PROXY 环境变量）后重试。\n"
+            f"原始错误：{last_err}"
+        )
+
+    title = info.get("title", "youtube")
+    log(f"视频：{title}（{info.get('duration', 0)} 秒）")
+
+    wav = out_dir / f"{_safe_name(title)}.wav"
+    if wav.is_file() and wav.stat().st_size > 0:
+        log(f"已下载过，直接使用：{wav.name}")
+        return wav
+
+    state = {"mark": 10}
+
+    def hook(d):
+        if d.get("status") == "downloading" and d.get("total_bytes"):
+            pct = int(d["downloaded_bytes"] * 100 / d["total_bytes"])
+            if pct >= state["mark"]:
+                log(f"下载中 {pct}%")
+                state["mark"] += 10
+        elif d.get("status") == "finished":
+            log("下载完成，转换 wav…")
+
+    opts = dict(win_opts)
+    opts.update({
+        "format": "bestaudio/best",
+        "outtmpl": str(out_dir / f"{_safe_name(title)}.%(ext)s"),
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+        "progress_hooks": [hook],
+        "skip_download": False,
+        "logger": type("L", (), {"debug": lambda s, m: None, "info": lambda s, m: None,
+                                 "warning": lambda s, m: log(f"[yt-dlp] {m}"),
+                                 "error": lambda s, m: log(f"[yt-dlp] {m}")})(),
+    })
+    with YoutubeDL(opts) as ydl:
+        ydl.download([url])
+
+    if not wav.is_file():
+        candidates = sorted(out_dir.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            raise RuntimeError("下载完成但找不到音频文件")
+        wav = candidates[-1]
+    log(f"已下载：{wav.name}")
+    return wav
+
+
 def download_bilibili(url: str, out_dir: str | Path, on_log: LogCb | None = None) -> Path:
     """下载 B 站视频音轨并转成 wav，返回文件路径。
 
@@ -318,21 +410,31 @@ class ScoreTranscriber:
         )
 
 
+def download_video(url: str, out_dir: str | Path, on_log: LogCb | None = None) -> Path:
+    """按域名分发视频音频下载（B 站 / YouTube）。"""
+    host = url.lower()
+    if "youtube.com" in host or "youtu.be" in host:
+        return download_youtube(url, out_dir, on_log)
+    if "bilibili.com" in host or "b23.tv" in host:
+        return download_bilibili(url, out_dir, on_log)
+    raise ValueError("不支持的视频链接：目前支持 bilibili.com、b23.tv、youtube.com、youtu.be")
+
+
 def run_in_thread(
     msg_queue: "queue.Queue[tuple]",
     make_transcriber: Callable[[], ScoreTranscriber],
-    bilibili_url: str | None = None,
+    video_url: str | None = None,
     **kwargs,
 ) -> None:
     """线程入口：把日志/进度/结果全部塞进队列，由 GUI 线程轮询。"""
     writer = _QueueWriter(msg_queue)
     try:
         with contextlib.redirect_stderr(writer):
-            if bilibili_url:
+            if video_url:
                 # 输出目录未指定时，下载完成拿到标题后再生成（downloads/<标题>_score）
                 dl_dir = kwargs.get("out_dir") or "downloads"
-                kwargs["audio_path"] = download_bilibili(
-                    bilibili_url, dl_dir,
+                kwargs["audio_path"] = download_video(
+                    video_url, dl_dir,
                     on_log=lambda s: msg_queue.put(("log", s)),
                 )
                 if kwargs.get("out_dir") is None:

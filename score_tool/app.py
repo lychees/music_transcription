@@ -77,7 +77,7 @@ class ScoreAssistantApp(tk.Tk):
         ttk.Button(files, text="浏览…", command=self._pick_outdir).grid(row=1, column=2, padx=6)
 
         ttk.Label(
-            files, text="本地音频文件路径或 B 站视频链接（BV/av/b23.tv）均可，自动识别",
+            files, text="本地音频文件路径或视频链接（B 站 / YouTube）均可，自动识别",
             foreground="#888",
         ).grid(row=2, column=1, sticky=tk.W, padx=6, pady=(0, 4))
 
@@ -333,8 +333,9 @@ class ScoreAssistantApp(tk.Tk):
         url = source if source.startswith(("http://", "https://")) else ""
         audio = "" if url else source
         if url:
-            if "bilibili.com" not in url and "b23.tv" not in url:
-                messagebox.showerror("链接", "请输入有效的 B 站视频链接（bilibili.com 或 b23.tv）。")
+            host = url.lower()
+            if not any(d in host for d in ("bilibili.com", "b23.tv", "youtube.com", "youtu.be")):
+                messagebox.showerror("链接", "请输入有效的视频链接（bilibili.com、b23.tv、youtube.com 或 youtu.be）。")
                 return
             self._audio_files = []
         else:
@@ -410,7 +411,7 @@ class ScoreAssistantApp(tk.Tk):
                 target=run_in_thread,
                 args=(self.q, lambda: transcriber),
                 kwargs=dict(
-                    bilibili_url=url or None,
+                    video_url=url or None,
                     audio_path=audio or (self._audio_files[0] if self._audio_files else ""),
                     out_dir=out_dir,
                     want_sheets=want_sheets,
